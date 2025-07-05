@@ -18,6 +18,7 @@ import android.widget.EditText
 import android.widget.LinearLayout
 import android.widget.Toast
 import androidx.activity.OnBackPressedCallback
+import androidx.annotation.OptIn
 import androidx.core.app.ShareCompat
 import androidx.databinding.Observable
 import androidx.fragment.app.FragmentContainerView
@@ -26,6 +27,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.lifecycleScope
 import androidx.lifecycle.viewModelScope
+import androidx.media3.common.util.UnstableApi
 import com.bumptech.glide.Glide
 import com.google.android.material.dialog.MaterialAlertDialogBuilder
 import com.myAllVideoBrowser.R
@@ -57,7 +59,7 @@ import com.myAllVideoBrowser.ui.main.player.VideoPlayerActivity
 import com.myAllVideoBrowser.ui.main.player.VideoPlayerFragment
 import com.myAllVideoBrowser.util.AppLogger
 import com.myAllVideoBrowser.util.AppUtil
-import com.myAllVideoBrowser.util.FileNameCleaner
+import com.myAllVideoBrowser.util.FileUtil
 import com.myAllVideoBrowser.util.proxy_utils.CustomProxyController
 import com.myAllVideoBrowser.util.proxy_utils.OkHttpProxyClient
 import kotlinx.coroutines.Dispatchers
@@ -311,6 +313,7 @@ class WebTabFragment : BaseWebTabFragment() {
         }
     }
 
+    @OptIn(UnstableApi::class)
     private fun onVideoPreviewPropagate(
         videoInfo: VideoInfo, format: String, isForce: Boolean
     ) {
@@ -353,7 +356,7 @@ class WebTabFragment : BaseWebTabFragment() {
     ) {
         val info = videoInfo.copy(
             id = UUID.randomUUID().toString(),
-            title = FileNameCleaner.cleanFileName(videoTitle),
+            title = FileUtil.FileNameCleaner.cleanFileName(videoTitle),
             formats = VideFormatEntityList(videoInfo.formats.formats.filter {
                 it.format?.contains(
                     format

@@ -1,5 +1,6 @@
 package com.myAllVideoBrowser.ui.component.binding
 
+import android.annotation.SuppressLint
 import androidx.databinding.BindingAdapter
 import android.webkit.WebChromeClient
 import android.webkit.WebView
@@ -19,6 +20,7 @@ object WebViewBinding {
         isEnabled?.let { settings.javaScriptEnabled = it }
     }
 
+    @SuppressLint("JavascriptInterface")
     @BindingAdapter("app:addJavascriptInterface")
     @JvmStatic
     fun WebView.addJavascriptInterface(name: String?) {

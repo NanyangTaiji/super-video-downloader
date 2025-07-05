@@ -1,0 +1,120 @@
+package com.myAllVideoBrowser;
+
+import android.content.Context;
+import androidx.work.Configuration;
+import androidx.work.WorkManager;
+import com.myAllVideoBrowser.di.component.DaggerAppComponent;
+import com.myAllVideoBrowser.util.AppLogger;
+import com.myAllVideoBrowser.util.ContextUtils;
+import com.myAllVideoBrowser.util.FileUtil;
+import com.myAllVideoBrowser.util.SharedPrefHelper;
+import com.myAllVideoBrowser.util.downloaders.generic_downloader.DaggerWorkerFactory;
+import com.yausername.ffmpeg.FFmpeg;
+import com.yausername.youtubedl_android.YoutubeDL;
+import com.yausername.youtubedl_android.YoutubeDLException;
+import dagger.android.AndroidInjector;
+import dagger.android.DaggerApplication;
+import io.reactivex.rxjava3.plugins.RxJavaPlugins;
+import java.io.File;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import javax.inject.Inject;
+
+public class DLApplication extends DaggerApplication {
+    public static final String DEBUG_TAG = "YOUTUBE_DL_DEBUG_TAG";
+
+    private AndroidInjector<? extends DaggerApplication> androidInjector;
+    private ExecutorService executorService;
+
+    @Inject
+    DaggerWorkerFactory workerFactory;
+
+    @Inject
+    SharedPrefHelper sharedPrefHelper;
+
+    @Inject
+    FileUtil fileUtil;
+
+    @Override
+    protected void attachBaseContext(Context base) {
+        super.attachBaseContext(base);
+        androidInjector = DaggerAppComponent.builder().application(this).build();
+    }
+
+    @Override
+    protected AndroidInjector<? extends DaggerApplication> applicationInjector() {
+        return androidInjector;
+    }
+
+    @Override
+    public void onCreate() {
+        super.onCreate();
+
+        // Initialize executor service for background tasks
+        executorService = Executors.newCachedThreadPool();
+
+        ContextUtils.initApplicationContext(getApplicationContext());
+
+        initializeFileUtils();
+
+        File file = fileUtil.getFolderDir();
+        Context ctx = getApplicationContext();
+
+        WorkManager.initialize(
+                ctx,
+                new Configuration.Builder()
+                        .setWorkerFactory(workerFactory)
+                        .build()
+        );
+
+        RxJavaPlugins.setErrorHandler(error ->
+                AppLogger.e("RxJavaError unhandled " + error)
+        );
+
+        // Execute background initialization tasks
+        executorService.execute(() -> {
+            if (!file.exists()) {
+                file.mkdirs();
+            }
+
+            initializeYoutubeDl();
+            updateYoutubeDL();
+        });
+    }
+
+    private void initializeFileUtils() {
+        boolean isExternal = sharedPrefHelper.getIsExternalUse();
+        boolean isAppDir = sharedPrefHelper.getIsAppDirUse();
+
+        FileUtil.IS_EXTERNAL_STORAGE_USE = isExternal;
+        FileUtil.IS_APP_DATA_DIR_USE = isAppDir;
+        FileUtil.INITIALIZED = true;
+    }
+
+    private void initializeYoutubeDl() {
+        try {
+            YoutubeDL.getInstance().init(getApplicationContext());
+            FFmpeg.getInstance().init(getApplicationContext());
+        } catch (YoutubeDLException e) {
+            AppLogger.e("failed to initialize youtubedl-android " + e);
+        }
+    }
+
+    private void updateYoutubeDL() {
+        try {
+            YoutubeDL.UpdateStatus status = YoutubeDL.getInstance()
+                    .updateYoutubeDL(getApplicationContext(), YoutubeDL.UpdateChannel.MASTER);
+            AppLogger.d("UPDATE_STATUS MASTER: " + status);
+        } catch (Throwable e) {
+            e.printStackTrace();
+        }
+    }
+
+    @Override
+    public void onTerminate() {
+        super.onTerminate();
+        if (executorService != null && !executorService.isShutdown()) {
+            executorService.shutdown();
+        }
+    }
+}

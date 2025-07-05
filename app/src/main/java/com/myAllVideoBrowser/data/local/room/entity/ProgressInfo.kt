@@ -4,7 +4,7 @@ import androidx.room.ColumnInfo
 import androidx.room.Entity
 import androidx.room.PrimaryKey
 import androidx.room.TypeConverters
-import com.myAllVideoBrowser.util.FileUtil.Companion.getFileSizeReadable
+import com.myAllVideoBrowser.util.FileUtil.getFileSizeReadable
 import com.myAllVideoBrowser.util.RoomConverter
 import com.myAllVideoBrowser.util.downloaders.generic_downloader.models.VideoTaskState
 import java.util.*

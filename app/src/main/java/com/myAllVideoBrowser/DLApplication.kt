@@ -82,7 +82,7 @@ open class DLApplication : DaggerApplication() {
 
         FileUtil.IS_EXTERNAL_STORAGE_USE = isExternal
         FileUtil.IS_APP_DATA_DIR_USE = isAppDir
-        FileUtil.INITIIALIZED = true
+        FileUtil.INITIALIZED = true
     }
 
     private fun initializeYoutubeDl() {
