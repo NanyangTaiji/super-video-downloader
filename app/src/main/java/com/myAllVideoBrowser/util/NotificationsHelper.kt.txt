@@ -15,7 +15,6 @@ import com.myAllVideoBrowser.util.downloaders.generic_downloader.models.VideoTas
 import com.myAllVideoBrowser.util.downloaders.youtubedl_downloader.YoutubeDlDownloaderWorker
 import java.io.File
 import javax.inject.Singleton
-import kotlin.jvm.java
 
 @Singleton
 class NotificationsHelper(private val context: Context) {
@@ -229,7 +228,7 @@ class NotificationsHelper(private val context: Context) {
             channel.setSound(null, null)
 
             val channelName =
-                context.getString(R.string.app_download_channel_id)
+                context.getString(com.myAllVideoBrowser.R.string.app_download_channel_id)
             channel.description = channelName
             // Add the channel
             notificationManager.createNotificationChannel(channel)

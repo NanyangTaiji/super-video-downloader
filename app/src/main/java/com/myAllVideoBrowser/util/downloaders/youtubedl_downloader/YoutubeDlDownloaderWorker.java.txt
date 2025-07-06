@@ -1,0 +1,782 @@
+package com.myAllVideoBrowser.util.downloaders.youtubedl_downloader;
+
+import android.annotation.SuppressLint;
+import android.content.Context;
+import android.net.Uri;
+import android.util.Base64;
+import androidx.core.net.UriKt;
+import androidx.work.WorkManager;
+import androidx.work.WorkerParameters;
+import com.myAllVideoBrowser.data.local.model.Proxy;
+import com.myAllVideoBrowser.data.local.room.entity.VideoFormatEntity;
+import com.myAllVideoBrowser.util.CookieUtils;
+import com.myAllVideoBrowser.util.downloaders.generic_downloader.GenericDownloader;
+import com.myAllVideoBrowser.util.downloaders.generic_downloader.models.VideoTaskItem;
+import com.myAllVideoBrowser.util.downloaders.generic_downloader.models.VideoTaskState;
+import com.myAllVideoBrowser.util.downloaders.generic_downloader.workers.GenericDownloadWorkerWrapper;
+import com.google.gson.Gson;
+import com.myAllVideoBrowser.util.AppLogger;
+import com.myAllVideoBrowser.util.FileUtil;
+import com.yausername.youtubedl_android.YoutubeDL;
+import com.yausername.youtubedl_android.YoutubeDLRequest;
+import com.yausername.youtubedl_android.YoutubeDLResponse;
+import io.reactivex.rxjava3.core.Observable;
+import io.reactivex.rxjava3.disposables.Disposable;
+import io.reactivex.rxjava3.schedulers.Schedulers;
+import java.io.File;
+import java.util.Date;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
+import java.util.Map;
+import java.util.Arrays;
+import java.util.List;
+import java.util.stream.Collectors;
+import android.util.Pair;
+
+public class YoutubeDlDownloaderWorker extends GenericDownloadWorkerWrapper {
+
+    public static boolean isCanceled = false;
+
+    public static final String IS_FINISHED_DOWNLOAD_ACTION_ERROR_KEY = "IS_FINISHED_DOWNLOAD_ACTION_ERROR_KEY";
+    public static final String STOP_SAVE_ACTION = "STOP_AND_SAVE";
+    public static final String DOWNLOAD_FILENAME_KEY = "download_filename";
+    public static final String IS_FINISHED_DOWNLOAD_ACTION_KEY = "action";
+    private static final int UPDATE_INTERVAL = 1000;
+
+    private File tmpFile;
+    private int isLiveCounter = 0;
+    private boolean isDownloadOk = false;
+    private boolean isDownloadJustStarted = false;
+    private Disposable monitorProcessDisposable;
+    private int progressCached = 0;
+    private Disposable downloadJobDisposable;
+    private File cookieFile;
+    private long lastTmpDirSize = 0L;
+
+    private volatile long time = 0L;
+
+    public YoutubeDlDownloaderWorker(Context appContext, WorkerParameters workerParams) {
+        super(appContext, workerParams);
+    }
+
+    @Override
+    protected void afterDone() {
+        if (monitorProcessDisposable != null) {
+            monitorProcessDisposable.dispose();
+        }
+    }
+
+    @Override
+    protected void handleAction(String action, VideoTaskItem task, Map<String, String> headers, boolean isFileRemove) {
+        switch (action) {
+            case GenericDownloader.DownloaderActions.DOWNLOAD:
+                isCanceled = false;
+                startDownload(task, false);
+                break;
+            case GenericDownloader.DownloaderActions.CANCEL:
+                isCanceled = true;
+                cancelDownload(task);
+                break;
+            case GenericDownloader.DownloaderActions.PAUSE:
+                isCanceled = false;
+                pauseDownload(task);
+                break;
+            case GenericDownloader.DownloaderActions.RESUME:
+                isCanceled = false;
+                resumeDownload(task);
+                break;
+            case STOP_SAVE_ACTION:
+                stopAndSave(task);
+                break;
+        }
+    }
+
+    private void stopAndSave(VideoTaskItem task) {
+        String taskId = inputData.getString(GenericDownloader.Constants.TASK_ID_KEY);
+
+        if (taskId != null) {
+            YoutubeDL.getInstance().destroyProcessById(taskId);
+
+            File partsFolder = fileUtil.tmpDir.resolve(taskId);
+            File[] files = partsFolder.listFiles();
+            File firstPart = (files != null && files.length > 0) ? files[0] : null;
+
+            File dist = new File(fileUtil.folderDir.getAbsolutePath(), task.title + ".mp4");
+
+            if (firstPart != null && firstPart.exists()) {
+                try {
+                    boolean moved = fileUtil.moveMedia(applicationContext, UriKt.toUri(firstPart), UriKt.toUri(dist));
+                    if (moved) {
+                        task.taskState = VideoTaskState.SUCCESS;
+                        finishWork(task);
+                    } else {
+                        task.taskState = VideoTaskState.ERROR;
+                        finishWork(task);
+                    }
+                } catch (Throwable e) {
+                    task.taskState = VideoTaskState.ERROR;
+                    finishWork(task);
+                }
+            } else {
+                task.taskState = VideoTaskState.ERROR;
+                finishWork(task);
+            }
+        }
+    }
+
+    @SuppressLint("CheckResult")
+    private void startDownload(VideoTaskItem task, boolean isContinue) {
+        String taskId = inputData.getString(GenericDownloader.Constants.TASK_ID_KEY);
+        if (taskId == null) {
+            throw new RuntimeException("Task ID is null");
+        }
+
+        VideoFormatEntity vFormat = deserializeVideoFormat(taskId);
+
+        String url = inputData.getString(GenericDownloader.Constants.ORIGIN_KEY);
+        if (url == null) {
+            throw new RuntimeException("URL is NULL");
+        }
+
+        AppLogger.d("Start download dl: " + vFormat.formatId + " " + url + " " + task);
+
+        String taskTitle = task.title;
+
+        hideNotifications(taskId);
+
+        YoutubeDLRequest request = new YoutubeDLRequest(url);
+
+        cookieFile = CookieUtils.addCookiesToRequest(
+                url, request, inputData.getString(GenericDownloader.Constants.ORIGIN_KEY)
+        );
+
+        tmpFile = new File(fileUtil.tmpDir + "/" + taskId);
+
+        if (!tmpFile.exists()) {
+            tmpFile.mkdir();
+        }
+
+        // Monitoring for LIVE stream downloading
+        monitorDownloadProcess(taskId, task);
+
+        configureYoutubedlRequest(request, vFormat, taskTitle, isContinue);
+
+        showProgress(taskId, taskTitle, 0, "Starting...", tmpFile);
+        saveProgress(taskId, new LineInfo(taskId, 0.0, 0.0, null, null, "Starting..."),
+                task.also(t -> t.taskState = VideoTaskState.DOWNLOADING)).blockingFirst();
+
+        if (downloadJobDisposable != null) {
+            downloadJobDisposable.dispose();
+        }
+
+        if (fileUtil.isFreeSpaceAvailable()) {
+            startDownloadProcess(url, request, task, taskId);
+        } else {
+            task.mId = taskId;
+            task.taskState = VideoTaskState.ERROR;
+            task.errorMessage = "Not enough space";
+            finishWork(task);
+        }
+    }
+
+    private void resumeDownload(VideoTaskItem task) {
+        startDownload(task, true);
+    }
+
+    private void pauseDownload(VideoTaskItem task) {
+        if (getDone()) return;
+
+        String id = inputData.getString(GenericDownloader.Constants.TASK_ID_KEY);
+        if (id != null) {
+            YoutubeDL.getInstance().destroyProcessById(id);
+
+            WorkManager.getInstance(applicationContext).cancelAllWorkByTag(id);
+
+            if (task.taskState != VideoTaskState.DOWNLOADING) {
+                task.mId = id;
+                task.taskState = VideoTaskState.PAUSE;
+                finishWork(task);
+            }
+        }
+    }
+
+    private void cancelDownload(VideoTaskItem task) {
+        String taskId = inputData.getString(GenericDownloader.Constants.TASK_ID_KEY);
+        boolean isFileRemove = inputData.getBoolean(GenericDownloader.Constants.IS_FILE_REMOVE_KEY, false);
+
+        if (taskId != null) {
+            YoutubeDL.getInstance().destroyProcessById(taskId);
+
+            File fileToRemove = new File(fileUtil.tmpDir + "/" + taskId);
+
+            if (isFileRemove) {
+                deleteRecursively(fileToRemove);
+            }
+
+            if (task.taskState != VideoTaskState.DOWNLOADING) {
+                task.mId = taskId;
+                task.taskState = VideoTaskState.CANCELED;
+                finishWork(task);
+            }
+        }
+    }
+
+    @SuppressLint("CheckResult")
+    private void startDownloadProcess(String url, YoutubeDLRequest request, VideoTaskItem task, String taskId) {
+        downloadJobDisposable = Observable.fromCallable(() -> {
+                    return YoutubeDL.getInstance().execute(request, taskId, (pr, etaInSeconds, line) -> {
+                        if (line.contains("[download] Destination:")) {
+                            isDownloadJustStarted = true;
+                        }
+                        if (line.matches(".*\\[download] {3}\\d+.*")) {
+                            isDownloadOk = true;
+                        }
+
+                        LineInfo lineInfo = null;
+                        try {
+                            lineInfo = parseInfoFromLine(line);
+                        } catch (Throwable e) {
+                            // ignore
+                        }
+
+                        progressCached = (int) pr;
+
+                        if (new Date().getTime() - time > UPDATE_INTERVAL && !getDone()) {
+                            time = new Date().getTime();
+
+                            long totalBytes = lineInfo != null ? (long) lineInfo.total : 0;
+                            long downloadBytes = (long) (totalBytes * (pr / 100));
+                            long downloadBytesFixed = Math.max(downloadBytes, 0);
+
+                            task.percent = (float) pr;
+                            task.totalSize = totalBytes;
+                            task.downloadSize = downloadBytesFixed;
+                            task.taskState = VideoTaskState.DOWNLOADING;
+
+                            saveProgress(taskId, lineInfo, task).blockingFirst();
+                            showProgress(taskId, task.title, (int) pr, line, tmpFile);
+
+                            if (!fileUtil.isFreeSpaceAvailable()) {
+                                task.mId = taskId;
+                                task.taskState = VideoTaskState.ERROR;
+                                task.errorMessage = "Not enough space";
+                                finishWork(task);
+                                return;
+                            }
+                        }
+                    });
+                })
+                .doOnError(throwable -> handleError(taskId, url, progressCached, throwable, task.title))
+                .onErrorComplete()
+                .subscribe(dlResponse -> {
+                    // Handle completion
+                    File[] list = tmpFile.listFiles();
+                    File finalFile = null;
+
+                    if (list != null && list.length > 0) {
+                        for (File file : list) {
+                            if (file.isFile() &&
+                                    (file.getName().toLowerCase().endsWith(".mp4") ||
+                                            file.getName().toLowerCase().endsWith(".mp3"))) {
+                                finalFile = file;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (dlResponse.getExitCode() == 0 && finalFile != null) {
+                        File destinationFile = new File(fixFileName(
+                                fileUtil.folderDir.resolve(finalFile.getName()).getAbsolutePath()
+                        ));
+
+                        boolean moved = fileUtil.moveMedia(
+                                applicationContext,
+                                Uri.fromFile(finalFile),
+                                Uri.fromFile(destinationFile)
+                        );
+
+                        if (cookieFile != null) {
+                            cookieFile.delete();
+                        }
+
+                        if (moved) {
+                            deleteRecursively(tmpFile);
+                        }
+
+                        VideoTaskItem resultTask = new VideoTaskItem(url);
+                        resultTask.fileName = finalFile.getName();
+                        resultTask.errorCode = moved ? 0 : 1;
+                        resultTask.percent = 100F;
+                        resultTask.taskState = moved ? VideoTaskState.SUCCESS : VideoTaskState.ERROR;
+                        finishWork(resultTask);
+                    } else {
+                        File[] fixedList = tmpFile.listFiles();
+                        if (cookieFile != null) {
+                            cookieFile.delete();
+                        }
+
+                        File firstFile = null;
+                        if (fixedList != null) {
+                            for (File file : fixedList) {
+                                if (!file.getName().contains("part")) {
+                                    firstFile = file;
+                                    break;
+                                }
+                            }
+                        }
+
+                        VideoTaskItem resultTask = new VideoTaskItem(url);
+                        if (firstFile != null) {
+                            resultTask.fileName = firstFile.getName();
+                        }
+                        resultTask.errorCode = 1;
+                        resultTask.taskState = VideoTaskState.ERROR;
+                        finishWork(resultTask);
+                    }
+                });
+    }
+
+    private void configureYoutubedlRequest(YoutubeDLRequest request, VideoFormatEntity vFormat,
+                                           String fileName, boolean isContinue) {
+        request.addOption("--progress");
+
+        int threadsCount = sharedPrefHelper.getM3u8DownloaderThreadCount() + 1;
+        request.addOption("-N", String.valueOf(threadsCount));
+
+        boolean isAudioOnly = "none".equals(vFormat.vcodec) && !"none".equals(vFormat.acodec);
+
+        if (isAudioOnly) {
+            request.addOption("--audio-quality", "0");
+            request.addOption("--extract-audio");
+            request.addOption("--audio-format", "mp3");
+        } else {
+            boolean videoOnly = !"none".equals(vFormat.vcodec) && "none".equals(vFormat.acodec);
+            if (videoOnly) {
+                request.addOption("-f", vFormat.formatId + "+bestaudio");
+            } else {
+                request.addOption("-f", vFormat.formatId);
+            }
+
+            request.addOption("--recode-video", "mp4");
+            request.addOption("--merge-output-format", "mp4");
+        }
+
+        request.addOption("--hls-prefer-native");
+        request.addOption("--hls-use-mpegts");
+
+        if (isContinue) {
+            request.addOption("--continue");
+        }
+
+        Proxy currentProxy = proxyController.getCurrentRunningProxy();
+        if (!currentProxy.equals(Proxy.noProxy())) {
+            Pair<String, String> credentials = proxyController.getProxyCredentials();
+            String user = credentials.first;
+            String password = credentials.second;
+
+            if (!user.isEmpty() && !password.isEmpty()) {
+                request.addOption("--proxy",
+                        "http://" + user + ":" + password + "@" + currentProxy.getHost() + ":" + currentProxy.getPort());
+            } else {
+                request.addOption("--proxy", currentProxy.getHost() + ":" + currentProxy.getPort());
+            }
+        }
+
+        request.addOption("-o", tmpFile.getAbsolutePath() + "/" + fileName + ".%(ext)s");
+
+        if (vFormat.httpHeaders != null) {
+            for (Map.Entry<String, String> entry : vFormat.httpHeaders.entrySet()) {
+                if (!"Cookie".equals(entry.getKey())) {
+                    request.addOption("--add-header", entry.getKey() + ":" + entry.getValue());
+                }
+            }
+        }
+    }
+
+    @SuppressLint("CheckResult")
+    private void monitorDownloadProcess(String taskId, VideoTaskItem task) {
+        monitorProcessDisposable = Observable.interval(0, 1, TimeUnit.SECONDS)
+                .subscribeOn(Schedulers.io())
+                .map(tick -> FileUtil.calculateFolderSize(tmpFile))
+                .onErrorReturn(throwable -> -1L)
+                .subscribe(folderSize -> {
+                    if (folderSize > 0 && folderSize != lastTmpDirSize) {
+                        String downloadedTmpFolderSize = FileUtil.getFileSizeReadable(folderSize.doubleValue());
+                        lastTmpDirSize = folderSize;
+
+                        if (progressCached > 0) {
+                            isDownloadOk = true;
+                            if (monitorProcessDisposable != null) {
+                                monitorProcessDisposable.dispose();
+                            }
+                            return;
+                        }
+
+                        if (isDownloadJustStarted && !isDownloadOk) {
+                            ++isLiveCounter;
+                            if (isLiveCounter > 2) {
+                                isLiveCounter = 3;
+
+                                long downloaded = lastTmpDirSize;
+                                task.taskState = VideoTaskState.DOWNLOADING;
+                                task.lineInfo = downloadedTmpFolderSize;
+                                task.downloadSize = downloaded;
+                                task.totalSize = downloaded;
+
+                                saveProgress(taskId, new LineInfo(
+                                        "LIVE",
+                                        downloaded,
+                                        downloaded,
+                                        null,
+                                        null,
+                                        "Downloading live stream...downloaded: " + downloadedTmpFolderSize +
+                                                ", press stop and save, to stop downloading and save downloaded at any time...!"
+                                ), task).blockingFirst();
+
+                                showProgress(taskId, task.title, 99,
+                                        "Downloading Live Stream... " + downloadedTmpFolderSize, tmpFile);
+                            }
+                        }
+                    }
+                });
+    }
+
+    private void handleError(String taskId, String url, int progressCached, Throwable throwable, String name) {
+        AppLogger.d("Download Error: " + throwable + "\ntaskId: " + taskId);
+
+        VideoTaskItem task = new VideoTaskItem(url);
+
+        if (isCanceled && throwable instanceof YoutubeDL.CanceledException) {
+            task.taskState = VideoTaskState.CANCELED;
+            task.errorCode = 0;
+        } else if (throwable instanceof YoutubeDL.CanceledException) {
+            task.taskState = VideoTaskState.PAUSE;
+            task.errorCode = 0;
+        } else {
+            task.taskState = VideoTaskState.ERROR;
+            task.errorCode = 1;
+            String message = throwable.getMessage();
+            if (message != null) {
+                task.errorMessage = message.replaceAll("WARNING:.+\n", "");
+            } else {
+                task.errorMessage = "";
+            }
+        }
+
+        task.fileName = name;
+        task.percent = (float) progressCached;
+
+        finishWork(task);
+    }
+
+    private LineInfo parseInfoFromLine(String line) {
+        if (line == null || !line.startsWith("[download]")) {
+            return line != null ? new LineInfo("download", 0.0, 0.0, null, null, line) : null;
+        }
+
+        String[] parts = line.split(" +");
+        if (parts.length < 2) return null;
+
+        String percentStr = parts[1].replace("%", "").trim();
+        Double percent = parseDouble(percentStr);
+        if (percent == null) return null;
+
+        int totalStrIndex = line.contains("~") ? 4 : 3;
+        if (parts.length <= totalStrIndex) return null;
+
+        String totalStr = parts[totalStrIndex];
+
+        Pattern unitPattern = Pattern.compile("\\p{L}");
+        Matcher unitMatcher = unitPattern.matcher(totalStr);
+        if (!unitMatcher.find()) return null;
+
+        String valueStr = totalStr.substring(0, unitMatcher.start());
+        Double totalValue = parseDouble(valueStr);
+        if (totalValue == null) return null;
+
+        String totalUnit = totalStr.substring(unitMatcher.start());
+        double totalParsed = LineInfo.parse(totalValue + " " + totalUnit);
+
+        String lastPart = parts[parts.length - 1];
+        Integer downloadedFrag = null;
+        Integer totalFrag = null;
+
+        if (lastPart.contains(")")) {
+            String[] fragParts = lastPart.split("/");
+            if (fragParts.length == 2) {
+                downloadedFrag = parseInteger(fragParts[0].replace("(frag ", ""));
+                totalFrag = parseInteger(fragParts[1].replace(") ", ""));
+            }
+        }
+
+        return new LineInfo(
+                "download",
+                totalParsed * percent / 100,
+                totalParsed,
+                downloadedFrag,
+                totalFrag,
+                line
+        );
+    }
+
+    private static class LineInfo {
+        final String id;
+        final double progress;
+        final double total;
+        final Integer fragDownloaded;
+        final Integer fragTotal;
+        final String sourceLine;
+
+        private static final long KB_FACTOR = 1000;
+        private static final long KIB_FACTOR = 1024;
+        private static final long MB_FACTOR = 1000 * KB_FACTOR;
+        private static final long MIB_FACTOR = 1024 * KIB_FACTOR;
+        private static final long GB_FACTOR = 1000 * MB_FACTOR;
+        private static final long GIB_FACTOR = 1024 * MIB_FACTOR;
+
+        LineInfo(String id, double progress, double total, Integer fragDownloaded, Integer fragTotal, String sourceLine) {
+            this.id = id;
+            this.progress = progress;
+            this.total = total;
+            this.fragDownloaded = fragDownloaded;
+            this.fragTotal = fragTotal;
+            this.sourceLine = sourceLine;
+        }
+
+        static double parse(String arg0) {
+            int spaceNdx = arg0.indexOf(" ");
+            if (spaceNdx == -1) return -1;
+
+            double ret = Double.parseDouble(arg0.substring(0, spaceNdx));
+            String unit = arg0.substring(spaceNdx + 1);
+
+            switch (unit) {
+                case "GB":
+                    return ret * GB_FACTOR;
+                case "GiB":
+                    return ret * GIB_FACTOR;
+                case "MB":
+                    return ret * MB_FACTOR;
+                case "MiB":
+                    return ret * MIB_FACTOR;
+                case "KB":
+                    return ret * KB_FACTOR;
+                case "KiB":
+                    return ret * KIB_FACTOR;
+                case "B":
+                    return ret;
+                default:
+                    return -1;
+            }
+        }
+
+        @Override
+        public String toString() {
+            return FileUtil.getFileSizeReadable(progress) + " / " +
+                    FileUtil.getFileSizeReadable(total) + "  frag: " +
+                    fragDownloaded + " / " + fragTotal;
+        }
+    }
+
+    private void showProgress(String taskId, String name, int progress, String line, File tmpFile) {
+        String text = line.replace(tmpFile.toString(), "");
+
+        VideoTaskItem taskItem = new VideoTaskItem("");
+        taskItem.mId = taskId;
+        taskItem.fileName = name;
+        taskItem.taskState = VideoTaskState.DOWNLOADING;
+        taskItem.percent = (float) progress;
+        taskItem.lineInfo = text;
+
+        Pair<Object, Object> data = notificationsHelper.createNotificationBuilder(taskItem);
+        showLongRunningNotificationAsync(data.first, data.second);
+    }
+
+    @SuppressLint("CheckResult")
+    @Override
+    public void finishWork(VideoTaskItem item) {
+        if (getDone()) {
+            try {
+                getContinuation().resume(androidx.work.ListenableWorker.Result.success());
+            } catch (Throwable e) {
+                e.printStackTrace();
+            }
+            return;
+        }
+
+        String taskId = inputData.getString(GenericDownloader.Constants.TASK_ID_KEY);
+
+        if (taskId != null) {
+            YoutubeDlDownloader.deleteHeadersStringFromSharedPreferences(applicationContext, taskId);
+        }
+
+        notificationsHelper.hideNotification(taskId.hashCode());
+
+        if (item != null) {
+            item.mId = taskId;
+            Pair<Object, Object> notificationData = notificationsHelper.createNotificationBuilder(item);
+            showNotificationFinal(taskId.hashCode(), notificationData.second);
+        }
+
+        if (downloadJobDisposable != null) {
+            downloadJobDisposable.dispose();
+            downloadJobDisposable = null;
+        }
+
+        if (cookieFile != null) {
+            cookieFile.delete();
+        }
+
+        if (taskId == null || item == null) {
+            try {
+                getContinuation().resume(androidx.work.ListenableWorker.Result.failure());
+            } catch (Throwable e) {
+                e.printStackTrace();
+            }
+            return;
+        }
+
+        saveProgress(taskId, new LineInfo(taskId, 0.0, 0.0, null, null,
+                item.errorMessage != null ? item.errorMessage : ""), item).blockingFirst();
+        setDone();
+
+        try {
+            if (item.taskState == VideoTaskState.ERROR) {
+                getContinuation().resume(androidx.work.ListenableWorker.Result.failure());
+            } else {
+                getContinuation().resume(androidx.work.ListenableWorker.Result.success());
+            }
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+    }
+
+    private Observable<Void> saveProgress(String taskId, LineInfo line, VideoTaskItem task) {
+        if (getDone() && task.taskState == VideoTaskState.DOWNLOADING) {
+            AppLogger.d("saveProgress task returned cause DONE!!!");
+            return Observable.empty();
+        }
+
+        boolean isBytesNoTouch = line == null || line.total == 0.0;
+        boolean iProgressUpdate = task.downloadSize > 0;
+
+        return progressRepository.getProgressInfos().take(1).toObservable()
+                .flatMap(progressList -> {
+                    Object dbTask = progressList.stream()
+                            .filter(p -> taskId.equals(getTaskId(p)))
+                            .findFirst()
+                            .orElse(null);
+
+                    if (dbTask != null) {
+                        if (!isBytesNoTouch) {
+                            setProgressTotal(dbTask, line != null ? (long) line.total : task.totalSize);
+                        }
+
+                        if (task.taskState != VideoTaskState.SUCCESS) {
+                            if (!isBytesNoTouch && iProgressUpdate) {
+                                setProgressDownloaded(dbTask, task.downloadSize);
+                            }
+                        } else {
+                            setProgressDownloaded(dbTask, getProgressTotal(dbTask));
+                        }
+
+                        setFragmentsTotal(dbTask, line != null ? line.fragTotal : 1);
+                        setFragmentsDownloaded(dbTask, line != null ? line.fragDownloaded : 0);
+                        setDownloadStatus(dbTask, task.taskState);
+                        setInfoLine(dbTask, line != null ? line.sourceLine : "");
+
+                        if (line != null && "LIVE".equals(line.id) && !getIsLive(dbTask)) {
+                            setIsLive(dbTask, true);
+                        }
+
+                        if (!getDone() || task.taskState != VideoTaskState.DOWNLOADING) {
+                            progressRepository.saveProgressInfo(dbTask);
+                        }
+                    }
+
+                    return Observable.empty();
+                });
+    }
+
+    private VideoFormatEntity deserializeVideoFormat(String taskId) {
+        String rawHeaders = GenericDownloader.getInstance()
+                .loadHeadersStringFromSharedPreferences(applicationContext, taskId);
+
+        if (rawHeaders == null) {
+            throw new RuntimeException("No headers found for task: " + taskId);
+        }
+
+        String decompressedRaw = YoutubeDlDownloader.decompressString(rawHeaders);
+        String decodedHeadersString = new String(Base64.decode(decompressedRaw, Base64.DEFAULT));
+
+        return new Gson().fromJson(decodedHeadersString, VideoFormatEntity.class);
+    }
+
+    private void hideNotifications(String taskId) {
+        notificationsHelper.hideNotification(taskId.hashCode());
+        notificationsHelper.hideNotification(taskId.hashCode() + 1);
+    }
+
+    // Helper methods
+    private static void deleteRecursively(File file) {
+        if (file.isDirectory()) {
+            File[] files = file.listFiles();
+            if (files != null) {
+                for (File child : files) {
+                    deleteRecursively(child);
+                }
+            }
+        }
+        file.delete();
+    }
+
+    private static Double parseDouble(String str) {
+        try {
+            return Double.parseDouble(str);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    private static Integer parseInteger(String str) {
+        try {
+            return Integer.parseInt(str);
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    // These methods would need to be implemented based on your progress entity structure
+    private String getTaskId(Object progressInfo) {
+        // Implementation depends on your progress entity
+        return null;
+    }
+
+    private void setProgressTotal(Object progressInfo, long total) {
+        // Implementation depends on your progress entity
+    }
+
+    private void setProgressDownloaded(Object progressInfo, long downloaded) {
+        // Implementation depends on your progress entity
+    }
+
+    private long getProgressTotal(Object progressInfo) {
+        // Implementation depends on your progress entity
+        return 0;
+    }
+
+    private void setFragmentsTotal(Object progressInfo, Integer total) {
+        // Implementation depends on your progress entity
+    }
+
+    private void setFragmentsDownloaded(Object progressInfo, Integer downloaded) {
+        // Implementation depends on your progress entity
+    }
+
+    private void setDownloadStatus(Object progressInfo, VideoTaskState state) {
+        // Implementation depends on your progress entity
+    }
+
+    //   private void setInfoLine(Object progress
+}
