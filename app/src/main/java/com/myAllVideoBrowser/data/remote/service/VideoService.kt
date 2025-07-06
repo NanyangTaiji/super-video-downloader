@@ -66,7 +66,7 @@ open class VideoServiceLocal(
             attachProxyToRequest(request, currentProxy)
         }
 
-        val tmpCookieFile = CookieUtils.addCookiesToRequest(url.url.toString(), request,null)
+        val tmpCookieFile = CookieUtils.addCookiesToRequest(url.url.toString(), request)
 
         try {
             val info = YoutubeDL.getInstance().getInfo(request)

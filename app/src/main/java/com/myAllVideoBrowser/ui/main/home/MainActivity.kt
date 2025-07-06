@@ -70,7 +70,8 @@ class MainActivity : BaseActivity() {
 
         AdsInitializerHelper.initializeAdBlocker(
             adBlockHostsRepository,
-            sharedPrefHelper
+            sharedPrefHelper,
+            lifecycleScope
         )
 
         mainViewModel = ViewModelProvider(this, viewModelFactory)[MainViewModel::class.java]

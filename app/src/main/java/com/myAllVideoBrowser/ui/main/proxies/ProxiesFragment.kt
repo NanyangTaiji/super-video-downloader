@@ -44,16 +44,11 @@ class ProxiesFragment : BaseFragment() {
 
                 if (isValidHost(host) && isValidPort(port.toString())) {
                     val newProxy = Proxy(
-                         host.hashCode().toString(),
-                         host,
-                         port.toString(),
-                         user,
-                         password,
-                        false,
-                        "",
-                        "",
-                        "",
-                        ""
+                        id = host.hashCode().toString(),
+                        host = host,
+                        port = port.toString(),
+                        user = user,
+                        password = password
                     )
                     setProxy(newProxy)
                 } else {

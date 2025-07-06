@@ -209,7 +209,8 @@ abstract class BaseWebTabFragment : BaseFragment() {
     private fun initializeAdBlocker() {
         AdsInitializerHelper.initializeAdBlocker(
             mainActivity.adBlockHostsRepository,
-            mainActivity.sharedPrefHelper
+            mainActivity.sharedPrefHelper,
+            lifecycle.coroutineScope
         )
     }
 
